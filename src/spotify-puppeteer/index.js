@@ -55,22 +55,63 @@ async function postEpisode(youtubeVideoInfo) {
 
   try {
     logger.info('Launching puppeteer');
+    const args = ['--no-sandbox'];
+    if (env.BROWSER_USER_DATA || env.BROWSER_USER_DATA === '') {
+      args.push(`--user-data-dir=${env.BROWSER_USER_DATA}`);
+    }
     browser = await puppeteer.launch({
-      args: ['--no-sandbox'],
+      args,
       headless: env.PUPPETEER_HEADLESS,
       protocolTimeout: env.UPLOAD_TIMEOUT,
     });
 
     page = await openNewPage('https://creators.spotify.com/pod/dashboard/episode/wizard');
 
-    logger.info('Setting language to English');
-    await setLanguageToEnglish();
+    logger.info('Trying to see if we should log in');
+    let shouldLogin = true;
+    const retries = 3;
+    let retry = 0;
+    while (retry < retries) {
+      try {
+        const createEpisodeHeaderSelector = 'header > h1 > div';
+        const createEpisodeHeaderText = await page.$eval(createEpisodeHeaderSelector, (el) => el.innerText);
+        console.log(`-- The header says ${createEpisodeHeaderText}`);
+        if (createEpisodeHeaderText.includes('Create episode')) {
+          shouldLogin = false;
+        }
+        break;
+      } catch (err) {
+        logger.info(`-- Failed checking if we should log in, continuing: ${err}`);
+        await sleepSeconds(2);
+        retry += 1;
+        // do nothing, we assume here that we should log in
+        // if there are other reasons why we can't check login status,
+        //  script will eventually throw error when trying to log in and using the screenshot we can see
+        //  that there is a problem trying to get the login status
+      }
+    }
 
-    logger.info('Set cookie banner acceptance');
-    await setAcceptedCookieBannerDate();
+    if (shouldLogin) {
+      logger.info('-- We should log in. Continuing');
 
-    logger.info('Trying to log in and open episode wizard');
-    await loginAndWaitForNewEpisodeWizard();
+      logger.info('Setting language to English');
+      await setLanguageToEnglish();
+
+      logger.info('Set cookie banner acceptance');
+      await setAcceptedCookieBannerDate();
+
+      logger.info('Trying to log in and open episode wizard');
+      await loginAndWaitForNewEpisodeWizard();
+    } else {
+      logger.info('-- We are logged in. Continuing');
+      logger.info('Set cookie banner acceptance');
+      await setAcceptedCookieBannerDate();
+    }
+
+    if (env.LOGIN_ONLY) {
+      logger.info('Yay, logged in.');
+      return;
+    }
 
     logger.info('Uploading audio file');
     await uploadEpisode();
@@ -147,7 +188,7 @@ async function postEpisode(youtubeVideoInfo) {
   async function loginAndWaitForNewEpisodeWizard() {
     await spotifyLogin();
     try {
-      logger('-- Waiting for navigation after logging in');
+      logger.info('-- Waiting for navigation after logging in');
       await page.waitForNavigation();
     } catch (err) {
       logger.info('-- The wait for navigation after logging failed or timed-out. Continuing.');
@@ -171,10 +212,11 @@ async function postEpisode(youtubeVideoInfo) {
     await sleepSeconds(2);
     logger.info('-- Logging in');
 
-    await page.waitForSelector('#login-username');
-    await page.type('#login-username', env.SPOTIFY_EMAIL);
+    const usernameOrEmailInputSelector = 'input[data-testid="login-username"]';
+    await page.waitForSelector(usernameOrEmailInputSelector);
+    await page.type(usernameOrEmailInputSelector, env.SPOTIFY_EMAIL);
 
-    const passwordInputFieldSelector = '#login-password';
+    const passwordInputFieldSelector = 'input[id="password"]';
     const passwordInputField = await page.$(passwordInputFieldSelector);
     const existsPasswordInputField = !!passwordInputField;
 
@@ -208,7 +250,7 @@ async function postEpisode(youtubeVideoInfo) {
    */
   async function clickLoginOrContinueButtonUntilItsNotPresent() {
     await sleepSeconds(1);
-    const loginOrContinueButtonSelector = 'button[id="login-button"]';
+    const loginOrContinueButtonSelector = 'button[data-testid="login-button"]';
     await page.waitForSelector(loginOrContinueButtonSelector, { visible: true });
     await clickSelector(page, loginOrContinueButtonSelector);
 
@@ -318,8 +360,12 @@ async function postEpisode(youtubeVideoInfo) {
       const inputEpisodeArt = await page.$(imageUploadInputSelector);
       await inputEpisodeArt.uploadFile(env.THUMBNAIL_FILE);
 
-      logger.info('-- Saving uploaded episode art');
-      await clickSelector(page, '::-p-xpath(//span[text()="Save"]/parent::button)');
+      logger.info(
+        '-- Saving uploaded episode art(clicking with focus and enter instead of regualr because for some reason the regular clicking moves to the final step which it should not.'
+      );
+      // NOTE: clicking by pressing enter with keyboard api because for some reason the regular clicking moves to the final step
+      // await clickSelector(page, '::-p-xpath(//span[text()="Save"]/parent::button)');
+      await clickSelectorUsingKeyboardEnter(page, '::-p-xpath(//span[text()="Save"]/parent::button)');
 
       logger.info('-- Waiting for uploaded episode art to be saved');
       await page.waitForSelector('::-p-xpath(//div[@data-encore-id="dialogConfirmation"])', {
@@ -385,6 +431,13 @@ async function clickSelector(page, selector, options = {}) {
   await page.waitForSelector(selector, options);
   const elementHandle = await page.$(selector);
   await clickDom(page, elementHandle);
+}
+
+async function clickSelectorUsingKeyboardEnter(page, selector, options = {}) {
+  await page.waitForSelector(selector, options);
+  const elementHandle = await page.$(selector);
+  await elementHandle.focus();
+  await page.keyboard.press('Enter');
 }
 
 async function clickDom(page, domElementHandle) {
